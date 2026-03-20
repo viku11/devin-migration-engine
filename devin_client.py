@@ -1,5 +1,5 @@
-import aiohttp
 import asyncio
+import aiohttp
 import os
 import time
 from dotenv import load_dotenv
