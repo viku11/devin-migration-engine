@@ -1,3 +1,14 @@
-requests==2.31.0
-rich==13.7.0
-python-dotenv==1.0.0
+# Async Networking (Required for the 7-slot pool)
+aiohttp==3.10.5
+
+# Synchronous Networking (For utility scripts)
+requests==2.32.3
+
+# Logging & Terminal UI
+rich==13.7.1
+
+# Environment Configuration
+python-dotenv==1.0.1
+
+# Utilities
+colorama==0.4.6
