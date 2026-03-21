@@ -1,72 +1,76 @@
 import asyncio
 import time
-from devin_client import (
-    create_devin_session,
-    check_github_for_pr,
-    stop_devin_session,
-    merge_github_pr
-)
+import logging
+from devin_client import DevinClient
+from state_store import StateStore
 
-# Constants
+logger = logging.getLogger(__name__)
+
 MAX_CONCURRENT_SESSIONS = 7
 PR_TIMEOUT = 600  # 10 Minutes
 
 
 class MigrationOrchestrator:
-    def __init__(self):
-        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+    """Manages async dispatch, rate limiting, and lifecycle of Devin sessions."""
 
-    async def process_file(self, file_path, branch_name, prompt):
+    def __init__(self, state_store: StateStore, devin_client: DevinClient):
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_SESSIONS)
+        self.store = state_store
+        self.client = devin_client
+
+    async def process_file(self, file_path: str, branch_name: str, prompt: str) -> bool:
+        """Processes a single file with strict concurrency limits and backoff logic."""
         async with self.semaphore:
-            # 1. Dispatch with Rate Limit Handling
+            # 1. Dispatch with Exponential Backoff
             session_id = None
+            base_delay = 5
+            max_delay = 60
+            attempt = 0
+
             while not session_id:
-                session_id = await create_devin_session(file_path, prompt)
+                session_id = await self.client.create_devin_session(file_path, prompt)
+
                 if session_id == "RATE_LIMIT":
-                    print(
-                        f"   [429] Rate limited on {file_path}. Backing off 30s...")
-                    await asyncio.sleep(30)
+                    delay = min(max_delay, base_delay * (2 ** attempt))
+                    logger.warning(
+                        f"[429] Rate limited on {file_path}. Backing off {delay}s...")
+                    await asyncio.sleep(delay)
+                    attempt += 1
                     session_id = None
                 elif not session_id:
-                    print(
-                        f"   [ERROR] Failed to start {file_path}. Retrying...")
+                    logger.error(
+                        f"[ERROR] Failed to start {file_path}. Retrying in 5s...")
                     await asyncio.sleep(5)
 
-            print(f"[DISPATCH] Session {session_id} active for {file_path}.")
+            session_url = f"https://app.devin.ai/sessions/{session_id}"
+            logger.info(
+                f"[DISPATCH] Session active for {file_path}: {session_url}")
+            self.store.mark_in_progress(file_path, session_id, session_url)
 
-            # 2. Closed-Loop Monitoring
+            # 2. Closed-Loop Polling
             start_time = time.time()
-            success = False
-
             while time.time() - start_time < PR_TIMEOUT:
-                pr_data = await check_github_for_pr(branch_name)
+                pr_data = await self.client.check_github_for_pr(branch_name)
 
                 if pr_data:
-                    pr_num = pr_data['number']
-                    print(f"[SUCCESS] PR #{pr_num} detected for {file_path}!")
+                    pr_url = pr_data.get('html_url', '')
+                    logger.info(
+                        f"[REVIEW REQUIRED] PR opened for {file_path}: {pr_url}")
 
-                    # 3. Finalize: Merge & Stop
-                    merged = await merge_github_pr(pr_num)
-                    if merged:
-                        print(f"   [MERGED] PR #{pr_num} merged successfully.")
-
-                    await stop_devin_session(session_id)
-                    success = True
-                    break
+                    # Agent finished successfully. Kill the container to free slot.
+                    await self.client.stop_devin_session(session_id)
+                    self.store.mark_completed(file_path, pr_url)
+                    return True
 
                 await asyncio.sleep(30)
                 elapsed = int(time.time() - start_time)
                 if elapsed % 60 == 0:
-                    print(
-                        f"   [POLLING] {file_path} - {elapsed}s/600s elapsed...")
+                    logger.debug(
+                        f"[POLLING] {file_path} - {elapsed}s/{PR_TIMEOUT}s elapsed...")
 
-            if not success:
-                print(
-                    f"[TIMEOUT] Abandoning {file_path} after 10 mins. Freeing slot.")
-                await stop_devin_session(session_id)
-
-            return success
-
-# Entry point logic for main.py would call:
-# orchestrator = MigrationOrchestrator()
-# await asyncio.gather(*[orchestrator.process_file(f, b, p) for f, b, p in tasks])
+            # 3. Timeout Handling
+            logger.warning(
+                f"[TIMEOUT] Abandoning {file_path} after 10 mins. Freeing slot.")
+            await self.client.stop_devin_session(session_id)
+            self.store.mark_dlq(file_path, "Timeout waiting for PR creation")
+            return False

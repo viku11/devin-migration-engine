@@ -1,21 +1,10 @@
-"""
-dependency_graph.py
--------------------
-Parses JSX import statements to build a dependency graph,
-then performs a topological sort to determine safe migration order.
-
-Key insight: Devin sessions don't share context between each other.
-If we migrate CartSummary.jsx before CartItem.jsx, Devin will
-hallucinate the CartItem types. Leaf nodes (no local deps) must go first.
-"""
-
 import os
 import re
 from collections import defaultdict, deque
 
 
 def find_all_jsx_files(src_dir: str) -> list[str]:
-    """Recursively find all .jsx files under src_dir."""
+    src_dir = os.path.abspath(src_dir)
     jsx_files = []
     for root, _, files in os.walk(src_dir):
         for f in files:
@@ -24,11 +13,7 @@ def find_all_jsx_files(src_dir: str) -> list[str]:
     return jsx_files
 
 
-def parse_local_imports(filepath: str, all_files_set: set) -> list[str]:
-    """
-    Parse a JSX file and return a list of local .jsx dependencies
-    that exist within our codebase.
-    """
+def parse_local_imports(filepath: str, all_files_set: set, norm_files_map: dict, src_dir: str) -> list[str]:
     deps = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -36,116 +21,88 @@ def parse_local_imports(filepath: str, all_files_set: set) -> list[str]:
     except Exception:
         return deps
 
-    # Match: import X from './foo' or '../bar/baz'
-    import_pattern = re.findall(
-        r"""import\s+.*?from\s+['"](\.[^'"]+)['"]""", content
-    )
+    # Capture anything in quotes starting with . or @/
+    import_paths = re.findall(r"['\"]((?:@/|\.)[^'\"]+)['\"]", content)
 
-    base_dir = os.path.dirname(filepath)
+    abs_src_dir = os.path.abspath(src_dir)
+    base_dir = os.path.dirname(os.path.abspath(filepath))
 
-    for imp in import_pattern:
-        # Try resolving with and without .jsx extension
+    for imp in set(import_paths):
+        if imp.startswith("@/"):
+            resolved_path = os.path.join(abs_src_dir, imp[2:])
+        else:
+            resolved_path = os.path.join(base_dir, imp)
+
+        # Try extensions to match actual files on disk
         candidates = [
-            os.path.normpath(os.path.join(base_dir, imp + ".jsx")),
-            os.path.normpath(os.path.join(base_dir, imp, "index.jsx")),
-            os.path.normpath(os.path.join(base_dir, imp)),
+            os.path.normpath(resolved_path),
+            os.path.normpath(resolved_path + ".jsx"),
+            os.path.normpath(os.path.join(resolved_path, "index.jsx")),
+            os.path.normpath(resolved_path + ".js"),
+            os.path.normpath(os.path.join(resolved_path, "index.js")),
         ]
-        for candidate in candidates:
-            if candidate in all_files_set:
-                deps.append(candidate)
+
+        for cand in candidates:
+            cand_norm = os.path.normcase(cand)
+            if cand_norm in norm_files_map:
+                deps.append(norm_files_map[cand_norm])
                 break
 
     return deps
 
 
 def build_dependency_graph(src_dir: str) -> tuple[dict, list[str]]:
-    """
-    Returns:
-        graph: dict mapping filepath -> set of files it DEPENDS ON
-        all_files: flat list of all jsx files
-    """
     all_files = find_all_jsx_files(src_dir)
-    all_files_set = set(all_files)
+    norm_files_map = {os.path.normcase(f): f for f in all_files}
     graph = defaultdict(set)
-
     for filepath in all_files:
-        deps = parse_local_imports(filepath, all_files_set)
+        deps = parse_local_imports(filepath, set(
+            all_files), norm_files_map, src_dir)
         for dep in deps:
-            graph[filepath].add(dep)
-
+            if dep != filepath:
+                graph[filepath].add(dep)
     return dict(graph), all_files
 
 
 def topological_sort_batches(graph: dict, all_files: list[str]) -> list[list[str]]:
-    """
-    Kahn's algorithm to produce batches of files that can be
-    safely migrated in parallel.
-
-    Batch 1 = leaf nodes (no local deps) — safest to migrate first.
-    Batch N = files that depend on all previous batches being done.
-
-    Returns list of batches, each batch is a list of filepaths.
-    """
-    # Build in-degree map: how many files does this file depend on?
     in_degree = {f: 0 for f in all_files}
-    # reverse_graph: who depends on ME?
     reverse_graph = defaultdict(set)
-
     for node, deps in graph.items():
-        for dep in deps:
-            in_degree[node] = in_degree.get(node, 0)
         in_degree[node] = len(deps)
         for dep in deps:
             reverse_graph[dep].add(node)
-
-    # Files with zero dependencies are our starting batch
     queue = deque([f for f in all_files if in_degree.get(f, 0) == 0])
     batches = []
     processed = set()
-
     while queue:
         current_batch = list(queue)
         batches.append(current_batch)
         queue = deque()
-
         for node in current_batch:
             processed.add(node)
-            # Reduce in-degree for everything that depends on this node
             for dependent in reverse_graph.get(node, []):
                 in_degree[dependent] -= 1
                 if in_degree[dependent] == 0 and dependent not in processed:
                     queue.append(dependent)
-
-    # Any files not reached (circular deps) go in a final catch-all batch
     unreached = [f for f in all_files if f not in processed]
     if unreached:
         batches.append(unreached)
-
     return batches
 
 
 def print_dependency_report(src_dir: str):
-    """Print a summary of the dependency graph and migration batches."""
-    graph, all_files = build_dependency_graph(src_dir)
+    abs_src = os.path.abspath(src_dir)
+    graph, all_files = build_dependency_graph(abs_src)
     batches = topological_sort_batches(graph, all_files)
-
-    print(f"\n{'='*60}")
-    print(f"  IDURAR ERP — Migration Dependency Analysis")
-    print(f"{'='*60}")
-    print(f"  Total JSX files found: {len(all_files)}")
-    print(f"  Migration batches: {len(batches)}")
-    print()
-
+    print(f"\n{'='*60}\n  IDURAR ERP — DYNAMIC DEPENDENCY SYNC\n{'='*60}")
+    print(f"  Total JSX files: {len(all_files)} | Batches: {len(batches)}\n")
     for i, batch in enumerate(batches):
-        label = "LEAF NODES (no deps — migrate first)" if i == 0 else f"Batch {i+1}"
+        label = "LEAF NODES" if i == 0 else f"Batch {i+1}"
         print(f"  [{label}] — {len(batch)} files")
-        for f in batch[:5]:  # Show first 5 to keep output clean
-            rel = os.path.relpath(f, src_dir)
-            print(f"    • {rel}")
-        if len(batch) > 5:
-            print(f"    ... and {len(batch) - 5} more")
-        print()
-
+        for f in batch:
+            rel = os.path.relpath(f, abs_src)
+            if "routes.jsx" in rel or "main.jsx" in rel:
+                print(f"    >>> FOUND CRITICAL FILE: {rel} <<<")
     return batches
 
 

@@ -1,5 +1,24 @@
+# Secrets & Configuration
 .env
+
+# Local State & Databases
 migration_state.db
+
+# Python Artifacts
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+
+# OS & Editor Artifacts
 .DS_Store
+.vscode/
+.idea/

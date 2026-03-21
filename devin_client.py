@@ -1,75 +1,83 @@
-import asyncio
 import aiohttp
 import os
-import time
+import logging
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Configuration
-DEVIN_API_KEY = os.getenv("DEVIN_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-ORG_ID = "org-0e2b658611d540688a1cba439bc03d04"
-REPO_OWNER = "viku11"
-REPO_NAME = "idurar-erp-crm"
-BASE_URL = "https://api.devin.ai/v3/organizations"
-
-headers = {
-    "Authorization": f"Bearer {DEVIN_API_KEY}",
-    "Content-Type": "application/json"
-}
-
-gh_headers = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
-}
+logger = logging.getLogger(__name__)
 
 
-async def create_devin_session(file_path, prompt):
-    """Dispatches the agent via V3 API."""
-    url = f"{BASE_URL}/{ORG_ID}/sessions"
-    payload = {
-        "prompt": prompt,
-        "snapshot_id": None  # Uses latest repo state
-    }
+class DevinClient:
+    """Manages API connections to Devin and GitHub using a shared connection pool."""
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
+    def __init__(self):
+        self.api_key = os.getenv("DEVIN_API_KEY")
+        self.gh_token = os.getenv("GITHUB_TOKEN")
+
+        if not self.api_key or not self.gh_token:
+            raise EnvironmentError(
+                "CRITICAL: DEVIN_API_KEY or GITHUB_TOKEN missing from environment.")
+
+        self.org_id = "org-0e2b658611d540688a1cba439bc03d04"
+        self.repo_owner = "viku11"
+        self.repo_name = "idurar-erp-crm"
+        self.base_url = f"https://api.devin.ai/v3/organizations/{self.org_id}/sessions"
+
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        self.gh_headers = {
+            "Authorization": f"token {self.gh_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Returns the active HTTP session or creates a new one."""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    async def create_devin_session(self, file_path: str, prompt: str) -> Optional[str]:
+        """Dispatches the agent via V3 API."""
+        payload = {"prompt": prompt, "snapshot_id": None}
+        session = await self._get_session()
+
+        async with session.post(self.base_url, headers=self.headers, json=payload) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data['session_id']
+                return data.get('session_id')
             elif resp.status == 429:
                 return "RATE_LIMIT"
+
+            logger.error(f"Devin API Error {resp.status} for {file_path}")
             return None
 
+    async def stop_devin_session(self, session_id: str) -> bool:
+        """Explicitly kills the container to free the slot."""
+        url = f"{self.base_url}/{session_id}/stop"
+        session = await self._get_session()
 
-async def stop_devin_session(session_id):
-    """Explicitly kills the container to free the slot."""
-    url = f"{BASE_URL}/{ORG_ID}/sessions/{session_id}/stop"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers) as resp:
+        async with session.post(url, headers=self.headers) as resp:
             return resp.status == 200
 
+    async def check_github_for_pr(self, branch_name: str) -> Optional[Dict[str, Any]]:
+        """Polls GitHub to see if the PR for the specific branch exists."""
+        url = f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/pulls"
 
-async def check_github_for_pr(branch_name):
-    """Polls GitHub to see if the PR for the specific branch exists."""
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/pulls"
-    params = {"head": f"{REPO_OWNER}:{branch_name}", "state": "open"}
+        # 'state': 'all' catches PRs even if a human already reviewed and merged them
+        params = {"head": f"{self.repo_owner}:{branch_name}", "state": "all"}
+        session = await self._get_session()
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=gh_headers, params=params) as resp:
+        async with session.get(url, headers=self.gh_headers, params=params) as resp:
             if resp.status == 200:
                 prs = await resp.json()
                 return prs[0] if prs else None
             return None
 
-
-async def merge_github_pr(pr_number):
-    """The 'Principal Move': Automatically merges the PR once detected."""
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/merge"
-    payload = {"merge_method": "squash",
-               "commit_title": f"Auto-merge PR #{pr_number}"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.put(url, headers=gh_headers, json=payload) as resp:
-            return resp.status == 200
+    async def close(self):
+        """Cleanly closes the network socket."""
+        if self.session and not self.session.closed:
+            await self.session.close()
