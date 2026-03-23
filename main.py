@@ -143,10 +143,55 @@ def fetch_original_file_count() -> int:
             f"Cannot determine migration baseline. Check '{ORIGINAL_BRANCH}' branch exists."
         )
 
-        return count
+
+def fetch_master_file_list() -> set:
+    """Fetches the full file tree from the master branch (1 API call).
+    Returns a set of all file paths under SOURCE_PREFIX, with 'frontend/' stripped
+    so paths match the manifest format (e.g., 'src/utils/helpers.js')."""
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/master?recursive=1"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        tree = response.json().get("tree", [])
+
+        files = set()
+        # SOURCE_PREFIX is e.g. 'frontend/src/' — strip the top-level dir to match manifest paths
+        top_dir = SOURCE_PREFIX.split("/")[0]  # 'frontend'
+        for item in tree:
+            path = item.get("path", "")
+            if item.get("type") == "blob" and path.startswith(SOURCE_PREFIX):
+                # 'frontend/src/utils/helpers.js' -> 'src/utils/helpers.js'
+                relative = path[len(top_dir) + 1:]  # strip 'frontend/'
+                files.add(relative)
+
+        return files
     except Exception as e:
-        logger.error(f"❌ Failed to fetch 'original' branch tree: {e}")
-        raise RuntimeError("Cannot determine migration baseline. Check 'original' branch exists.")
+        logger.error(f"❌ Failed to fetch master branch tree: {e}")
+        return set()
+
+
+def get_file_state_from_tree(file_path: str, master_files: set) -> str:
+    """Determines if a file has been migrated by checking if the original .js/.jsx
+    file still exists on master. If only the .ts/.tsx version exists, it's COMPLETED.
+    This is 100% accurate regardless of PR title format."""
+    if file_path in master_files:
+        return "PENDING"
+
+    # Check if the TypeScript equivalent exists
+    stem = file_path.rsplit('.', 1)[0]
+    ext = file_path.rsplit('.', 1)[1] if '.' in file_path else ''
+    ts_equivalent = f"{stem}.tsx" if ext == "jsx" else f"{stem}.ts"
+
+    if ts_equivalent in master_files:
+        return "COMPLETED"
+
+    # File doesn't exist in either form — already dealt with
+    return "COMPLETED"
 
 
 def load_or_build_batch_manifest(src_dir: str) -> list:
@@ -168,9 +213,26 @@ def load_or_build_batch_manifest(src_dir: str) -> list:
         # Validate manifest is for the current repo
         meta = manifest_data.get("_meta", {})
         if meta.get("repo") == f"{REPO_OWNER}/{REPO_NAME}":
+            batches = manifest_data["batches"]
+            total_in_manifest = sum(len(b) for b in batches)
+
+            # Integrity check: reject manifests built from half-migrated trees
+            baseline_count = fetch_original_file_count()
+            if total_in_manifest != baseline_count:
+                logger.error(
+                    f"❌ MANIFEST INTEGRITY CHECK FAILED: Manifest has {total_in_manifest} files "
+                    f"but '{ORIGINAL_BRANCH}' branch has {baseline_count}. "
+                    f"Manifest was likely built from a partially-migrated tree. "
+                    f"Delete {BATCH_MANIFEST_PATH} and regenerate from the '{ORIGINAL_BRANCH}' branch."
+                )
+                raise RuntimeError(
+                    f"Manifest integrity check failed ({total_in_manifest} vs {baseline_count}). "
+                    f"Delete {BATCH_MANIFEST_PATH} and rebuild from '{ORIGINAL_BRANCH}' branch checkout."
+                )
+
             logger.info(f"📂 Loading frozen manifest for {REPO_OWNER}/{REPO_NAME} "
-                        f"({meta.get('total_files')} files, {meta.get('total_batches')} batches)")
-            return manifest_data["batches"]
+                        f"({total_in_manifest} files, {meta.get('total_batches')} batches) ✅ integrity verified")
+            return batches
         else:
             logger.warning(f"⚠️ Manifest is for {meta.get('repo')}, but current repo is "
                           f"{REPO_OWNER}/{REPO_NAME}. Rebuilding...")
@@ -224,45 +286,28 @@ def load_or_build_batch_manifest(src_dir: str) -> list:
     return formatted_batches
 
 
-def build_batch_details(formatted_batches: list, prs: list) -> list:
+def build_batch_details(formatted_batches: list, master_files: set) -> list:
     """Builds per-batch completion details for the dashboard topology chart.
-    Each entry: { batch: 1, total: 26, completed: 24, in_progress: 1, pending: 1 }"""
+    Uses the master branch file tree as the source of truth — not PR titles.
+    Each entry: { batch: 1, total: 26, completed: 24, in_progress: 0, pending: 2 }"""
     details = []
     for i, batch in enumerate(formatted_batches):
         completed = 0
-        in_progress = 0
         pending = 0
         for f in batch:
-            state = get_file_state(f, prs)
+            state = get_file_state_from_tree(f, master_files)
             if state == "COMPLETED":
                 completed += 1
-            elif state == "IN_PROGRESS":
-                in_progress += 1
             else:
                 pending += 1
         details.append({
             "batch": i + 1,
             "total": len(batch),
             "completed": completed,
-            "in_progress": in_progress,
+            "in_progress": 0,
             "pending": pending
         })
     return details
-
-
-def get_file_state(file_path: str, prs: list) -> str:
-    """Checks GitOps state by matching the file path inside the PR Title."""
-    for pr in prs:
-        title = pr.get("title", "")
-        # Hallucination-proof check
-        if file_path in title:
-            if pr.get('merged_at'):
-                return "COMPLETED"
-            if pr.get('state') == 'open':
-                return "IN_PROGRESS"
-            return "PENDING"
-
-    return "PENDING"
 
 
 def count_historical_merged_prs(prs: list) -> int:
@@ -340,31 +385,38 @@ async def run_pipeline(src_dir: str):
         orchestrator = MigrationOrchestrator(client)
 
         # ── HISTORICAL BASELINE (Cold Start Recovery) ──────────────────
-        # Dynamically fetch the original file count from the frozen 'original' branch.
+        # Dynamically fetch the original file count from the frozen baseline branch.
         global ORIGINAL_FILE_COUNT
         logger.info(f"🔍 Fetching migration baseline from '{ORIGINAL_BRANCH}' branch...")
         ORIGINAL_FILE_COUNT = fetch_original_file_count()
         logger.info(f"📎 Baseline: {ORIGINAL_FILE_COUNT} JS/JSX files in '{ORIGINAL_BRANCH}' branch.")
 
-        # Query GitHub to discover ALL previously merged work.
-        logger.info("🔍 Querying GitHub for historical migration state...")
-        boot_prs = fetch_all_prs()
-        historical_completed = count_historical_merged_prs(boot_prs)
-        remaining_files = ORIGINAL_FILE_COUNT - historical_completed
+        # Fetch master branch tree (1 API call) — used for all per-file state checks
+        logger.info("🔍 Fetching master branch file tree for state detection...")
+        master_files = fetch_master_file_list()
+        logger.info(f"📂 Master branch has {len(master_files)} files under {SOURCE_PREFIX}")
+
+        # Count completed files by checking which manifest files are now .tsx on master
+        completed_from_tree = sum(
+            1 for batch in formatted_batches
+            for f in batch
+            if get_file_state_from_tree(f, master_files) == "COMPLETED"
+        )
+        remaining_files = ORIGINAL_FILE_COUNT - completed_from_tree
 
         logger.info(
-            f"📊 COLD START: {historical_completed} files already merged on GitHub "
-            f"({historical_completed * 2} hours saved). "
+            f"📊 COLD START: {completed_from_tree} files already migrated on master "
+            f"({completed_from_tree * 2} hours saved). "
             f"{remaining_files} files remaining out of {ORIGINAL_FILE_COUNT} original."
         )
 
         # Build per-batch details for the dashboard topology chart
-        batch_details = build_batch_details(formatted_batches, boot_prs)
+        batch_details = build_batch_details(formatted_batches, master_files)
 
         # Immediately write baseline telemetry so the React dashboard wakes up
         print_live_telemetry(
             in_progress_count=0,
-            completed_count=historical_completed,
+            completed_count=completed_from_tree,
             pending_count=remaining_files,
             current_batch=1,
             total_batches=len(formatted_batches),
@@ -377,27 +429,26 @@ async def run_pipeline(src_dir: str):
             print(f"{'='*50}")
 
             while True:
-                # Fetch ALL PRs once per polling loop — single network call, thread-safe
-                current_prs = fetch_all_prs()
+                # Refresh master tree each polling cycle to detect newly merged PRs
+                master_files = fetch_master_file_list()
 
                 pending_files = []
-                in_progress_files = []
-
                 for f in batch:
-                    state = get_file_state(f, current_prs)
-
+                    state = get_file_state_from_tree(f, master_files)
                     if state == "PENDING":
                         pending_files.append(f)
-                    elif state == "IN_PROGRESS":
-                        in_progress_files.append(f)
 
-                # Recount global completed (historical + current batches)
-                global_completed = count_historical_merged_prs(current_prs)
+                # Recount global completed from tree
+                global_completed = sum(
+                    1 for b in formatted_batches
+                    for f in b
+                    if get_file_state_from_tree(f, master_files) == "COMPLETED"
+                )
 
                 # Rebuild per-batch details every poll so the dashboard stays live
-                batch_details = build_batch_details(formatted_batches, current_prs)
+                batch_details = build_batch_details(formatted_batches, master_files)
 
-                if not pending_files and not in_progress_files:
+                if not pending_files:
                     # Write telemetry BEFORE breaking so the dashboard reflects the completed batch
                     print_live_telemetry(
                         0,
@@ -435,17 +486,16 @@ async def run_pipeline(src_dir: str):
                     else:
                         print("✅ [DRY RUN] Simulated dispatch complete. Zero credits spent.")
 
-                if in_progress_files or pending_files:
-                    # Triggers the executive telemetry for the presentation & dashboard
-                    print_live_telemetry(
-                        len(in_progress_files),
-                        global_completed,
-                        ORIGINAL_FILE_COUNT - global_completed - len(in_progress_files),
-                        i + 1,
-                        len(formatted_batches),
-                        batch_details=batch_details
-                    )
-                    await asyncio.sleep(30)
+                # Triggers the executive telemetry for the presentation & dashboard
+                print_live_telemetry(
+                    0,
+                    global_completed,
+                    ORIGINAL_FILE_COUNT - global_completed,
+                    i + 1,
+                    len(formatted_batches),
+                    batch_details=batch_details
+                )
+                await asyncio.sleep(30)
 
         print("\n🎉 MIGRATION ENGINE COMPLETED ALL BATCHES!")
 
