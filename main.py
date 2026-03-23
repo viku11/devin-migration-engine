@@ -39,6 +39,7 @@ ORIGINAL_BRANCH = os.getenv("ORIGINAL_BRANCH", "original")
 TARGET_BRANCH = os.getenv("TARGET_BRANCH", "master")
 SOURCE_PREFIX = os.getenv("SOURCE_PREFIX", "frontend/src/")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
+DISPATCH_DELAY = int(os.getenv("DISPATCH_DELAY", "2"))
 
 if not GITHUB_TOKEN or not REPO_OWNER or not REPO_NAME:
     raise RuntimeError(
@@ -503,8 +504,8 @@ async def run_pipeline(src_dir: str):
                                     orchestrator.process_file(f, branch, prompt))
                                 tasks.append(task)
                                 active_session_keys.add(f"{i+1}:{f}")
-                                # 10-second API rate limit safeguard
-                                await asyncio.sleep(10)
+                                # Stagger dispatch to avoid Devin API rate limits
+                                await asyncio.sleep(DISPATCH_DELAY)
                             else:
                                 print(f"  🛑 [DRY RUN] Would have dispatched agent for: {f}")
                                 await asyncio.sleep(1)
