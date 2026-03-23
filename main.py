@@ -417,6 +417,10 @@ async def run_pipeline(src_dir: str):
         # Build per-batch details for the dashboard topology chart
         batch_details = build_batch_details(formatted_batches, master_files)
 
+        # Track active Devin session keys to report accurate "active agents" on dashboard
+        # Format: "batch_index:filepath" — pruned when the file appears as .tsx on master
+        active_session_keys = set()
+
         # Immediately write baseline telemetry so the React dashboard wakes up
         print_live_telemetry(
             in_progress_count=0,
@@ -452,12 +456,24 @@ async def run_pipeline(src_dir: str):
                 # Rebuild per-batch details every poll so the dashboard stays live
                 batch_details = build_batch_details(formatted_batches, master_files)
 
+                # Prune sessions whose files are now merged on master
+                merged_keys = set()
+                for key in active_session_keys:
+                    filepath = key.split(":", 1)[1]
+                    if get_file_state_from_tree(filepath, master_files) == "COMPLETED":
+                        merged_keys.add(key)
+                if merged_keys:
+                    active_session_keys -= merged_keys
+                    logger.info(f"🧹 Pruned {len(merged_keys)} completed sessions from active tracker")
+
                 if not pending_files:
+                    # Clear any remaining keys for this batch
+                    active_session_keys = {k for k in active_session_keys if not k.startswith(f"{i+1}:")}
                     # Write telemetry BEFORE breaking so the dashboard reflects the completed batch
                     print_live_telemetry(
-                        0,
+                        len(active_session_keys),
                         global_completed,
-                        ORIGINAL_FILE_COUNT - global_completed,
+                        ORIGINAL_FILE_COUNT - global_completed - len(active_session_keys),
                         i + 1,
                         len(formatted_batches),
                         batch_details=batch_details
@@ -467,38 +483,48 @@ async def run_pipeline(src_dir: str):
                     break
 
                 if pending_files:
-                    print(
-                        f"\n🚀 Staggering dispatch for {len(pending_files)} PENDING file(s)...")
-                    tasks = []
-                    for f in pending_files:
-                        branch = get_unique_branch_name(f)
-                        prompt = build_migration_prompt(f, branch)
+                    # Filter out files that already have an active session
+                    new_files = [f for f in pending_files if f"{i+1}:{f}" not in active_session_keys]
+                    already_active = len(pending_files) - len(new_files)
+                    if already_active > 0:
+                        print(f"   ⏭️ {already_active} file(s) already have active agents — skipping re-dispatch")
+
+                    if new_files:
+                        print(
+                            f"\n🚀 Staggering dispatch for {len(new_files)} NEW file(s)...")
+                        tasks = []
+                        for f in new_files:
+                            branch = get_unique_branch_name(f)
+                            prompt = build_migration_prompt(f, branch)
+
+                            if not DRY_RUN:
+                                task = asyncio.create_task(
+                                    orchestrator.process_file(f, branch, prompt))
+                                tasks.append(task)
+                                active_session_keys.add(f"{i+1}:{f}")
+                                # 10-second API rate limit safeguard
+                                await asyncio.sleep(10)
+                            else:
+                                print(f"  🛑 [DRY RUN] Would have dispatched agent for: {f}")
+                                active_session_keys.add(f"{i+1}:{f}")
+                                await asyncio.sleep(1)
 
                         if not DRY_RUN:
-                            task = asyncio.create_task(
-                                orchestrator.process_file(f, branch, prompt))
-                            tasks.append(task)
-                            # 10-second API rate limit safeguard
-                            await asyncio.sleep(10)
+                            await asyncio.gather(*tasks)
+                            print(f"✅ Dispatch complete. {len(active_session_keys)} agents active.")
                         else:
-                            print(f"  🛑 [DRY RUN] Would have dispatched agent for: {f}")
-                            await asyncio.sleep(1)
-
-                    if not DRY_RUN:
-                        await asyncio.gather(*tasks)
-                        print("✅ Dispatch complete. Agents are working.")
-                    else:
-                        print("✅ [DRY RUN] Simulated dispatch complete. Zero credits spent.")
+                            print(f"✅ [DRY RUN] Simulated dispatch complete. {len(active_session_keys)} tracked.")
 
                 # Triggers the executive telemetry for the presentation & dashboard
                 print_live_telemetry(
-                    0,
+                    len(active_session_keys),
                     global_completed,
-                    ORIGINAL_FILE_COUNT - global_completed,
+                    ORIGINAL_FILE_COUNT - global_completed - len(active_session_keys),
                     i + 1,
                     len(formatted_batches),
                     batch_details=batch_details
                 )
+                print(f"\n💤 Polling in 30s... ({len(active_session_keys)} agents active)")
                 await asyncio.sleep(30)
 
         print("\n🎉 MIGRATION ENGINE COMPLETED ALL BATCHES!")
