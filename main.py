@@ -33,15 +33,24 @@ ORIGINAL_FILE_COUNT = None  # Set at runtime by fetch_original_file_count()
 
 # --- GITHUB GITOPS CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-REPO_OWNER = os.getenv("REPO_OWNER", "viku11")
-REPO_NAME = os.getenv("REPO_NAME", "idurar-erp-crm")
+REPO_OWNER = os.getenv("REPO_OWNER")
+REPO_NAME = os.getenv("REPO_NAME")
+ORIGINAL_BRANCH = os.getenv("ORIGINAL_BRANCH", "original")
+SOURCE_PREFIX = os.getenv("SOURCE_PREFIX", "frontend/src/")
+
+if not GITHUB_TOKEN or not REPO_OWNER or not REPO_NAME:
+    raise RuntimeError(
+        "\u274c Missing required env vars: GITHUB_TOKEN, REPO_OWNER, REPO_NAME. "
+        "Check your .env file."
+    )
 
 # Anchored telemetry export path (cross-OS safe, CWD-independent)
 SCRIPT_DIR = Path(__file__).resolve().parent
 TELEMETRY_EXPORT_PATH = SCRIPT_DIR.parent / "command-center" / "public" / "telemetry.json"
 
-# Frozen batch manifest — computed once from 'original' branch, reused across restarts
-BATCH_MANIFEST_PATH = SCRIPT_DIR / "batch_manifest.json"
+# Frozen batch manifest — keyed to repo, auto-generated from GitHub API
+# Format: {owner}_{repo}_manifest.json — works for any target repo
+BATCH_MANIFEST_PATH = SCRIPT_DIR / f"{REPO_OWNER}_{REPO_NAME}_manifest.json"
 
 
 def get_unique_branch_name(full_path: str) -> str:
@@ -101,9 +110,9 @@ def fetch_all_prs():
 
 
 def fetch_original_file_count() -> int:
-    """Queries the GitHub Trees API against the frozen 'original' branch to count
-    all .js and .jsx files under frontend/src/. This is the true migration denominator."""
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/original?recursive=1"
+    """Queries the GitHub Trees API against the frozen baseline branch to count
+    all .js and .jsx files under the configured source prefix."""
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/{ORIGINAL_BRANCH}?recursive=1"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
@@ -117,12 +126,22 @@ def fetch_original_file_count() -> int:
         count = 0
         for item in tree:
             path = item.get("path", "")
-            if item.get("type") == "blob" and path.startswith("frontend/src/"):
+            if item.get("type") == "blob" and path.startswith(SOURCE_PREFIX):
                 if path.endswith(".js") or path.endswith(".jsx"):
                     count += 1
 
         if count == 0:
-            logger.warning("⚠️ 'original' branch returned 0 JS/JSX files. Check branch name.")
+            logger.warning(
+                f"⚠️ '{ORIGINAL_BRANCH}' branch returned 0 JS/JSX files. "
+                f"Check ORIGINAL_BRANCH and SOURCE_PREFIX in .env."
+            )
+
+        return count
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch '{ORIGINAL_BRANCH}' branch tree: {e}")
+        raise RuntimeError(
+            f"Cannot determine migration baseline. Check '{ORIGINAL_BRANCH}' branch exists."
+        )
 
         return count
     except Exception as e:
@@ -131,32 +150,76 @@ def fetch_original_file_count() -> int:
 
 
 def load_or_build_batch_manifest(src_dir: str) -> list:
-    """Loads a frozen batch manifest from disk. If none exists, builds the DAG
-    from the local 'original' source tree, freezes it to batch_manifest.json,
-    and returns it. Subsequent runs reuse the frozen manifest — batch assignments
-    are permanently idempotent regardless of migration progress on master."""
+    """Loads a frozen batch manifest from disk, or builds one dynamically.
+    
+    Architecture:
+    - Keyed to {owner}/{repo} — works for any target repository.
+    - Auto-invalidates if REPO_OWNER/REPO_NAME changes in .env.
+    - Uses the GitHub Trees API (1 call) to get the original file count for validation.
+    - Uses the local src_dir for DAG construction (import parsing needs file contents).
+    - Persisted until deleted or repo config changes.
+    - Batch assignments are permanently idempotent."""
+    from dependency_graph import build_dependency_graph, topological_sort_batches
 
+    # Check for existing frozen manifest
     if BATCH_MANIFEST_PATH.exists():
-        logger.info(f"📂 Loading frozen batch manifest from {BATCH_MANIFEST_PATH}")
         with open(BATCH_MANIFEST_PATH, "r") as f:
-            return json.load(f)
+            manifest_data = json.load(f)
+        # Validate manifest is for the current repo
+        meta = manifest_data.get("_meta", {})
+        if meta.get("repo") == f"{REPO_OWNER}/{REPO_NAME}":
+            logger.info(f"📂 Loading frozen manifest for {REPO_OWNER}/{REPO_NAME} "
+                        f"({meta.get('total_files')} files, {meta.get('total_batches')} batches)")
+            return manifest_data["batches"]
+        else:
+            logger.warning(f"⚠️ Manifest is for {meta.get('repo')}, but current repo is "
+                          f"{REPO_OWNER}/{REPO_NAME}. Rebuilding...")
 
-    logger.info("🔨 No manifest found. Building immutable DAG from source tree...")
+    # ── BUILD FROM LOCAL SOURCE + VALIDATE AGAINST GITHUB ─────────────
+    logger.info(f"🔨 No manifest found. Building immutable DAG from local source tree...")
+    logger.info(f"   Source: {src_dir}")
+
     graph, all_files = build_dependency_graph(src_dir)
     batches = topological_sort_batches(graph, all_files)
 
     src_path = Path(src_dir).resolve()
     frontend_path = src_path.parent
 
-    formatted_batches = [[Path(f).relative_to(
-        frontend_path).as_posix() for f in b] for b in batches]
+    formatted_batches = []
+    for batch in batches:
+        formatted = [Path(f).relative_to(frontend_path).as_posix() for f in batch
+                     if f.endswith((".js", ".jsx"))]
+        if formatted:
+            formatted_batches.append(formatted)
 
-    # Freeze to disk — this file becomes the permanent source of truth for batch assignments
+    total_files = sum(len(b) for b in formatted_batches)
+
+    # Validate against GitHub's 'original' branch (single API call)
+    original_count = fetch_original_file_count()
+    if total_files != original_count:
+        logger.warning(
+            f"⚠️ Local tree has {total_files} files but 'original' branch has {original_count}. "
+            f"Ensure your local repo is on the correct branch for manifest generation."
+        )
+
+    # Freeze manifest with metadata for validation and portability
+    manifest_data = {
+        "_meta": {
+            "repo": f"{REPO_OWNER}/{REPO_NAME}",
+            "baseline_branch": ORIGINAL_BRANCH,
+            "source_prefix": SOURCE_PREFIX,
+            "total_files": total_files,
+            "total_batches": len(formatted_batches),
+            "original_branch_count": original_count,
+        },
+        "batches": formatted_batches
+    }
+
     with open(BATCH_MANIFEST_PATH, "w") as f:
-        json.dump(formatted_batches, f, indent=2)
+        json.dump(manifest_data, f, indent=2)
 
-    logger.info(f"✅ Frozen batch manifest saved to {BATCH_MANIFEST_PATH} "
-                f"({len(formatted_batches)} batches, {sum(len(b) for b in formatted_batches)} files)")
+    logger.info(f"✅ Frozen manifest saved to {BATCH_MANIFEST_PATH} "
+                f"({len(formatted_batches)} batches, {total_files} files)")
 
     return formatted_batches
 
@@ -279,9 +342,9 @@ async def run_pipeline(src_dir: str):
         # ── HISTORICAL BASELINE (Cold Start Recovery) ──────────────────
         # Dynamically fetch the original file count from the frozen 'original' branch.
         global ORIGINAL_FILE_COUNT
-        logger.info("🔍 Fetching migration baseline from 'original' branch...")
+        logger.info(f"🔍 Fetching migration baseline from '{ORIGINAL_BRANCH}' branch...")
         ORIGINAL_FILE_COUNT = fetch_original_file_count()
-        logger.info(f"📎 Baseline: {ORIGINAL_FILE_COUNT} JS/JSX files in 'original' branch.")
+        logger.info(f"📎 Baseline: {ORIGINAL_FILE_COUNT} JS/JSX files in '{ORIGINAL_BRANCH}' branch.")
 
         # Query GitHub to discover ALL previously merged work.
         logger.info("🔍 Querying GitHub for historical migration state...")

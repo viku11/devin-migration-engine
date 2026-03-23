@@ -1,0 +1,59 @@
+{
+  "_meta": {
+    "repo": "viku11/idurar-erp-crm",
+    "baseline_branch": "original",
+    "source_prefix": "frontend/src/",
+    "total_files": 33,
+    "total_batches": 7,
+    "original_branch_count": 226
+  },
+  "batches": [
+    [
+      "src/redux/auth/actions.js",
+      "src/redux/erp/actions.js"
+    ],
+    [
+      "src/forms/DynamicForm/index.jsx"
+    ],
+    [
+      "src/modules/InvoiceModule/RecordPaymentModule/components/Payment.jsx",
+      "src/modules/InvoiceModule/UpdateInvoiceModule/index.jsx",
+      "src/modules/PaymentModule/ReadPaymentModule/index.jsx",
+      "src/modules/PaymentModule/UpdatePaymentModule/components/Payment.jsx",
+      "src/modules/ProfileModule/index.jsx",
+      "src/modules/QuoteModule/UpdateQuoteModule/index.jsx",
+      "src/modules/SettingModule/CompanyLogoSettingsModule/index.jsx",
+      "src/modules/SettingModule/CompanySettingsModule/index.jsx",
+      "src/modules/SettingModule/FinanceSettingsModule/index.jsx",
+      "src/modules/SettingModule/GeneralSettingsModule/index.jsx",
+      "src/modules/SettingModule/MoneyFormatSettingsModule/index.jsx"
+    ],
+    [
+      "src/modules/InvoiceModule/RecordPaymentModule/index.jsx",
+      "src/modules/PaymentModule/UpdatePaymentModule/index.jsx",
+      "src/pages/Customer/index.jsx",
+      "src/pages/Invoice/InvoiceCreate.jsx",
+      "src/pages/Invoice/InvoiceRead.jsx",
+      "src/pages/Invoice/InvoiceUpdate.jsx",
+      "src/pages/Invoice/index.jsx",
+      "src/pages/Payment/PaymentRead.jsx",
+      "src/pages/Payment/index.jsx",
+      "src/pages/Settings/CompanyLogoSettings.jsx",
+      "src/pages/Settings/CompanySettings.jsx",
+      "src/pages/Settings/FinanceSettings.jsx",
+      "src/pages/Settings/GeneralSettings.jsx",
+      "src/pages/Settings/MoneyFormatSettings.jsx"
+    ],
+    [
+      "src/pages/Invoice/InvoiceRecordPayment.jsx",
+      "src/pages/Payment/PaymentUpdate.jsx",
+      "src/pages/Settings/Settings.jsx"
+    ],
+    [
+      "src/router/routes.jsx"
+    ],
+    [
+      "src/main.jsx"
+    ]
+  ]
+}

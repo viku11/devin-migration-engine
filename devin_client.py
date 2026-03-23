@@ -13,12 +13,12 @@ class DevinClient:
 
     def __init__(self):
         self.api_key = os.getenv("DEVIN_API_KEY")
-        self.org_id = os.getenv(
-            "DEVIN_ORG_ID", "org-0e2b658611d540688a1cba439bc03d04")
+        self.org_id = os.getenv("DEVIN_ORG_ID")
+        self.repo = os.getenv("GITHUB_REPO")
 
-        if not self.api_key:
+        if not self.api_key or not self.org_id:
             raise EnvironmentError(
-                "CRITICAL: DEVIN_API_KEY missing from environment.")
+                "CRITICAL: DEVIN_API_KEY and DEVIN_ORG_ID must be set in .env.")
 
         # Base URL for creating and listing sessions
         self.base_url = f"https://api.devin.ai/v3/organizations/{self.org_id}/sessions"

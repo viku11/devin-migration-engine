@@ -5,7 +5,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("DEVIN_API_KEY")
-ORG_ID = os.getenv("DEVIN_ORG_ID", "org-0e2b658611d540688a1cba439bc03d04")
+ORG_ID = os.getenv("DEVIN_ORG_ID")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+
+if not API_KEY or not ORG_ID:
+    raise RuntimeError("❌ Missing DEVIN_API_KEY or DEVIN_ORG_ID in .env")
+
 BASE_URL = f"https://api.devin.ai/v3/organizations/{ORG_ID}/sessions"
 
 headers = {
@@ -15,7 +20,7 @@ headers = {
 
 
 def cleanup_inactive_sessions():
-    print(f"🔍 Fetching Devin sessions for organization: {ORG_ID}...")
+    print(f"🔍 Fetching Devin sessions for organization: {ORG_ID} (repo: {GITHUB_REPO or 'ALL'})...")
 
     response = requests.get(BASE_URL, headers=headers)
     if response.status_code != 200:

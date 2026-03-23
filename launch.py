@@ -1,10 +1,10 @@
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from dependency_graph import build_dependency_graph, topological_sort_batches
-from main import run_pipeline
+from main import run_pipeline, BATCH_MANIFEST_PATH, REPO_OWNER, REPO_NAME, ORIGINAL_BRANCH
 
 # Load environment variables
 load_dotenv()
@@ -12,38 +12,29 @@ load_dotenv()
 
 async def preflight_and_launch():
     # Dynamically resolve path from .env, or use a relative fallback
-    # Fallback assumes migration-engine and idurar-erp-crm are in the same parent folder
     target_repo = os.getenv(
         "TARGET_REPO_PATH", "../idurar-erp-crm/frontend/src")
     src_dir = Path(target_repo).resolve().as_posix()
-
-    if not os.path.exists(src_dir):
-        print(f"\n❌ CRITICAL ABORT: Source directory not found at {src_dir}")
-        print("Please set TARGET_REPO_PATH in your .env file.")
-        return
 
     print("\n" + "="*50)
     print(" 🚀 INITIATING MIGRATION PRE-FLIGHT CHECK")
     print("="*50)
 
-    # 1. Verification
-    graph, all_files = build_dependency_graph(src_dir)
-    batches = topological_sort_batches(graph, all_files)
-    total_files = sum(len(b) for b in batches)
+    # Use frozen manifest if available (avoids scanning half-migrated local tree)
+    if BATCH_MANIFEST_PATH.exists():
+        with open(BATCH_MANIFEST_PATH, "r") as f:
+            manifest_data = json.load(f)
+        meta = manifest_data.get("_meta", {})
+        total_files = meta.get("total_files", 0)
+        num_batches = meta.get("total_batches", 0)
+        print(f" [✓] Frozen manifest found for {meta.get('repo', 'unknown')}")
+        print(f" [✓] Baseline: {total_files} files across {num_batches} batches (from '{meta.get('baseline_branch', ORIGINAL_BRANCH)}' branch)")
+    else:
+        print(f" [i] No frozen manifest found — will be generated from local source tree at boot.")
+        total_files = None
+        num_batches = None
 
-    print(f" [✓] Target repository located: {src_dir}")
-
-    if total_files == 0:
-        print(
-            f"\n❌ CRITICAL ABORT: No migratable JS/JSX files found in {src_dir}.")
-        return
-
-    print(f" [✓] Dependency Graph built. Total target files: {total_files}")
-    print(
-        f" [✓] Topology verified. Codebase split into {len(batches)} optimal batches.")
-    print(f" [✓] Circular dependencies isolated to final batch.")
-
-    # Updated for the stateless GitOps architecture video script
+    print(f" [✓] Target repo: {REPO_OWNER}/{REPO_NAME}")
     print(f" [✓] Stateless GitOps Architecture Active (GitHub API Polling).")
     print(f" [✓] Auto-Sleep ACU Protections enabled (Zero-cost wait states).")
 
@@ -55,7 +46,7 @@ async def preflight_and_launch():
     time.sleep(3)
     print("="*50 + "\n")
 
-    # 2. Trigger the Main Engine
+    # Trigger the Main Engine (src_dir is only used as fallback if no manifest exists)
     await run_pipeline(src_dir)
 
 if __name__ == "__main__":
