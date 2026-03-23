@@ -32,13 +32,13 @@ async def preflight_and_launch():
     total_files = sum(len(b) for b in batches)
 
     print(f" [✓] Target repository located: {src_dir}")
-    print(f" [✓] Dependency Graph built. Total target files: {total_files}")
 
-    if total_files != 120:
+    if total_files == 0:
         print(
-            f"\n❌ CRITICAL ABORT: Expected 120 files, but graph caught {total_files}.")
+            f"\n❌ CRITICAL ABORT: No migratable JS/JSX files found in {src_dir}.")
         return
 
+    print(f" [✓] Dependency Graph built. Total target files: {total_files}")
     print(
         f" [✓] Topology verified. Codebase split into {len(batches)} optimal batches.")
     print(f" [✓] Circular dependencies isolated to final batch.")

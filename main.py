@@ -26,8 +26,9 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_OWNER = os.getenv("REPO_OWNER", "viku11")
 REPO_NAME = os.getenv("REPO_NAME", "idurar-erp-crm")
 
-# Global cache to save API calls per polling loop
-ALL_PRS = None
+# Anchored telemetry export path (cross-OS safe, CWD-independent)
+SCRIPT_DIR = Path(__file__).resolve().parent
+TELEMETRY_EXPORT_PATH = SCRIPT_DIR.parent / "command-center" / "public" / "telemetry.json"
 
 
 def get_unique_branch_name(full_path: str) -> str:
@@ -60,6 +61,16 @@ def fetch_all_prs():
     try:
         while url:
             response = requests.get(url, headers=headers, params=params)
+
+            # Rate-limit backoff: sleep until the reset window if we hit 403
+            if response.status_code == 403:
+                import time as _time
+                reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+                wait_seconds = max(reset_time - int(_time.time()), 5)
+                logger.warning(f"⚠️ GitHub rate limit hit. Sleeping {wait_seconds}s...")
+                _time.sleep(wait_seconds)
+                continue
+
             response.raise_for_status()
             all_prs.extend(response.json())
 
@@ -76,13 +87,9 @@ def fetch_all_prs():
         raise RuntimeError("Cannot verify Git state. Check your GITHUB_TOKEN.")
 
 
-def get_file_state(file_path: str) -> str:
+def get_file_state(file_path: str, prs: list) -> str:
     """Checks GitOps state by matching the file path inside the PR Title."""
-    global ALL_PRS
-    if ALL_PRS is None:
-        ALL_PRS = fetch_all_prs()
-
-    for pr in ALL_PRS:
+    for pr in prs:
         title = pr.get("title", "")
         # Hallucination-proof check
         if file_path in title:
@@ -127,12 +134,9 @@ def print_live_telemetry(in_progress_count: int, completed_count: int, pending_c
 
     # Write to the Vite public folder so the React app can fetch it live
     try:
-        export_path = Path("../command-center/public/telemetry.json").resolve()
+        TELEMETRY_EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-        # Ensure the directory exists just in case
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(export_path, "w") as f:
+        with open(TELEMETRY_EXPORT_PATH, "w") as f:
             json.dump(telemetry_data, f)
     except Exception as e:
         logger.warning(
@@ -160,16 +164,15 @@ async def run_pipeline(src_dir: str):
             print(f"{'='*50}")
 
             while True:
-                # Clear the global cache at the start of each polling loop to get fresh GitHub data
-                global ALL_PRS
-                ALL_PRS = None
+                # Fetch ALL PRs once per polling loop — single network call, thread-safe
+                current_prs = fetch_all_prs()
 
                 pending_files = []
                 in_progress_files = []
 
                 for f in batch:
                     # Passing the file path instead of the branch name to prevent AI hallucination blocks
-                    state = get_file_state(f)
+                    state = get_file_state(f, current_prs)
 
                     if state == "PENDING":
                         pending_files.append(f)
@@ -177,6 +180,16 @@ async def run_pipeline(src_dir: str):
                         in_progress_files.append(f)
 
                 if not pending_files and not in_progress_files:
+                    # Write telemetry BEFORE breaking so the dashboard reflects the completed batch (cold start fix)
+                    total_completed = sum(
+                        1 for b in formatted_batches for file in b if get_file_state(file, current_prs) == "COMPLETED")
+                    print_live_telemetry(
+                        0,
+                        total_completed,
+                        sum(len(b) for b in formatted_batches[i+1:]),
+                        i + 1,
+                        len(formatted_batches)
+                    )
                     print(
                         f"✅ Batch {i+1} completely merged. Moving to next batch...")
                     break
@@ -201,7 +214,7 @@ async def run_pipeline(src_dir: str):
 
                 if in_progress_files or pending_files:
                     total_completed = sum(
-                        1 for b in formatted_batches for file in b if get_file_state(file) == "COMPLETED")
+                        1 for b in formatted_batches for file in b if get_file_state(file, current_prs) == "COMPLETED")
 
                     # Triggers the executive telemetry for the presentation & dashboard
                     print_live_telemetry(
