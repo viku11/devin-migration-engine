@@ -40,6 +40,9 @@ REPO_NAME = os.getenv("REPO_NAME", "idurar-erp-crm")
 SCRIPT_DIR = Path(__file__).resolve().parent
 TELEMETRY_EXPORT_PATH = SCRIPT_DIR.parent / "command-center" / "public" / "telemetry.json"
 
+# Frozen batch manifest — computed once from 'original' branch, reused across restarts
+BATCH_MANIFEST_PATH = SCRIPT_DIR / "batch_manifest.json"
+
 
 def get_unique_branch_name(full_path: str) -> str:
     """Converts 'src/components/DataTable/DataTable.jsx' to 'migrate/src-components-DataTable-DataTable'"""
@@ -127,6 +130,63 @@ def fetch_original_file_count() -> int:
         raise RuntimeError("Cannot determine migration baseline. Check 'original' branch exists.")
 
 
+def load_or_build_batch_manifest(src_dir: str) -> list:
+    """Loads a frozen batch manifest from disk. If none exists, builds the DAG
+    from the local 'original' source tree, freezes it to batch_manifest.json,
+    and returns it. Subsequent runs reuse the frozen manifest — batch assignments
+    are permanently idempotent regardless of migration progress on master."""
+
+    if BATCH_MANIFEST_PATH.exists():
+        logger.info(f"📂 Loading frozen batch manifest from {BATCH_MANIFEST_PATH}")
+        with open(BATCH_MANIFEST_PATH, "r") as f:
+            return json.load(f)
+
+    logger.info("🔨 No manifest found. Building immutable DAG from source tree...")
+    graph, all_files = build_dependency_graph(src_dir)
+    batches = topological_sort_batches(graph, all_files)
+
+    src_path = Path(src_dir).resolve()
+    frontend_path = src_path.parent
+
+    formatted_batches = [[Path(f).relative_to(
+        frontend_path).as_posix() for f in b] for b in batches]
+
+    # Freeze to disk — this file becomes the permanent source of truth for batch assignments
+    with open(BATCH_MANIFEST_PATH, "w") as f:
+        json.dump(formatted_batches, f, indent=2)
+
+    logger.info(f"✅ Frozen batch manifest saved to {BATCH_MANIFEST_PATH} "
+                f"({len(formatted_batches)} batches, {sum(len(b) for b in formatted_batches)} files)")
+
+    return formatted_batches
+
+
+def build_batch_details(formatted_batches: list, prs: list) -> list:
+    """Builds per-batch completion details for the dashboard topology chart.
+    Each entry: { batch: 1, total: 26, completed: 24, in_progress: 1, pending: 1 }"""
+    details = []
+    for i, batch in enumerate(formatted_batches):
+        completed = 0
+        in_progress = 0
+        pending = 0
+        for f in batch:
+            state = get_file_state(f, prs)
+            if state == "COMPLETED":
+                completed += 1
+            elif state == "IN_PROGRESS":
+                in_progress += 1
+            else:
+                pending += 1
+        details.append({
+            "batch": i + 1,
+            "total": len(batch),
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending
+        })
+    return details
+
+
 def get_file_state(file_path: str, prs: list) -> str:
     """Checks GitOps state by matching the file path inside the PR Title."""
     for pr in prs:
@@ -159,10 +219,10 @@ def count_historical_merged_prs(prs: list) -> int:
     return count
 
 
-def print_live_telemetry(in_progress_count: int, completed_count: int, pending_count: int, current_batch: int, total_batches: int):
+def print_live_telemetry(in_progress_count: int, completed_count: int, pending_count: int, current_batch: int, total_batches: int, batch_details: list = None):
     """Calculates and prints real-time metrics, and exports JSON to the React Command Center."""
     human_hours_saved = completed_count * 2
-    # Progress is measured against the ORIGINAL 229-file baseline, not the shrinking DAG
+    # Progress is measured against the ORIGINAL file baseline, not the shrinking DAG
     total_files = ORIGINAL_FILE_COUNT
     progress_pct = (completed_count / total_files * 100) if total_files > 0 else 0
 
@@ -189,6 +249,10 @@ def print_live_telemetry(in_progress_count: int, completed_count: int, pending_c
         "posture": {"security": "Zero-Trust (PR-Gated)", "resilience": "Stateless Auto-Resume Active"}
     }
 
+    # Include per-batch file counts and completion status for the topology bar chart
+    if batch_details:
+        telemetry_data["batch_details"] = batch_details
+
     # Write to the Vite public folder so the React app can fetch it live
     try:
         TELEMETRY_EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -205,14 +269,11 @@ async def run_pipeline(src_dir: str):
     client = DevinClient()
 
     try:
-        graph, all_files = build_dependency_graph(src_dir)
-        batches = topological_sort_batches(graph, all_files)
+        # ── IDEMPOTENT BATCH MANIFEST ──────────────────────────────────
+        # Load frozen manifest or build it once from the original source tree.
+        # Batch assignments are permanent — file X is Batch N forever.
+        formatted_batches = load_or_build_batch_manifest(src_dir)
 
-        src_path = Path(src_dir).resolve()
-        frontend_path = src_path.parent
-
-        formatted_batches = [[Path(f).relative_to(
-            frontend_path).as_posix() for f in b] for b in batches]
         orchestrator = MigrationOrchestrator(client)
 
         # ── HISTORICAL BASELINE (Cold Start Recovery) ──────────────────
@@ -234,13 +295,17 @@ async def run_pipeline(src_dir: str):
             f"{remaining_files} files remaining out of {ORIGINAL_FILE_COUNT} original."
         )
 
+        # Build per-batch details for the dashboard topology chart
+        batch_details = build_batch_details(formatted_batches, boot_prs)
+
         # Immediately write baseline telemetry so the React dashboard wakes up
         print_live_telemetry(
             in_progress_count=0,
             completed_count=historical_completed,
             pending_count=remaining_files,
             current_batch=1,
-            total_batches=len(formatted_batches)
+            total_batches=len(formatted_batches),
+            batch_details=batch_details
         )
 
         for i, batch in enumerate(formatted_batches):
@@ -256,7 +321,6 @@ async def run_pipeline(src_dir: str):
                 in_progress_files = []
 
                 for f in batch:
-                    # Passing the file path instead of the branch name to prevent AI hallucination blocks
                     state = get_file_state(f, current_prs)
 
                     if state == "PENDING":
@@ -267,6 +331,9 @@ async def run_pipeline(src_dir: str):
                 # Recount global completed (historical + current batches)
                 global_completed = count_historical_merged_prs(current_prs)
 
+                # Rebuild per-batch details every poll so the dashboard stays live
+                batch_details = build_batch_details(formatted_batches, current_prs)
+
                 if not pending_files and not in_progress_files:
                     # Write telemetry BEFORE breaking so the dashboard reflects the completed batch
                     print_live_telemetry(
@@ -274,7 +341,8 @@ async def run_pipeline(src_dir: str):
                         global_completed,
                         ORIGINAL_FILE_COUNT - global_completed,
                         i + 1,
-                        len(formatted_batches)
+                        len(formatted_batches),
+                        batch_details=batch_details
                     )
                     print(
                         f"✅ Batch {i+1} completely merged. Moving to next batch...")
@@ -311,7 +379,8 @@ async def run_pipeline(src_dir: str):
                         global_completed,
                         ORIGINAL_FILE_COUNT - global_completed - len(in_progress_files),
                         i + 1,
-                        len(formatted_batches)
+                        len(formatted_batches),
+                        batch_details=batch_details
                     )
                     await asyncio.sleep(30)
 
