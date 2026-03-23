@@ -38,6 +38,7 @@ REPO_NAME = os.getenv("REPO_NAME")
 ORIGINAL_BRANCH = os.getenv("ORIGINAL_BRANCH", "original")
 TARGET_BRANCH = os.getenv("TARGET_BRANCH", "master")
 SOURCE_PREFIX = os.getenv("SOURCE_PREFIX", "frontend/src/")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 
 if not GITHUB_TOKEN or not REPO_OWNER or not REPO_NAME:
     raise RuntimeError(
@@ -506,14 +507,13 @@ async def run_pipeline(src_dir: str):
                                 await asyncio.sleep(10)
                             else:
                                 print(f"  🛑 [DRY RUN] Would have dispatched agent for: {f}")
-                                active_session_keys.add(f"{i+1}:{f}")
                                 await asyncio.sleep(1)
 
                         if not DRY_RUN:
                             await asyncio.gather(*tasks)
                             print(f"✅ Dispatch complete. {len(active_session_keys)} agents active.")
                         else:
-                            print(f"✅ [DRY RUN] Simulated dispatch complete. {len(active_session_keys)} tracked.")
+                            print(f"✅ [DRY RUN] Simulated dispatch complete. Zero credits spent.")
 
                 # Triggers the executive telemetry for the presentation & dashboard
                 print_live_telemetry(
@@ -524,8 +524,8 @@ async def run_pipeline(src_dir: str):
                     len(formatted_batches),
                     batch_details=batch_details
                 )
-                print(f"\n💤 Polling in 30s... ({len(active_session_keys)} agents active)")
-                await asyncio.sleep(30)
+                print(f"\n💤 Polling in {POLL_INTERVAL}s... ({len(active_session_keys)} agents active)")
+                await asyncio.sleep(POLL_INTERVAL)
 
         print("\n🎉 MIGRATION ENGINE COMPLETED ALL BATCHES!")
 
