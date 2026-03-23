@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 # Set to False before the real recording.
 DRY_RUN = True
 
+# --- ORIGINAL MIGRATION BASELINE ---
+# Dynamically fetched from the 'original' branch at boot via GitHub Trees API.
+# This is the denominator for all progress/ROI calculations.
+ORIGINAL_FILE_COUNT = None  # Set at runtime by fetch_original_file_count()
+
 # --- GITHUB GITOPS CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_OWNER = os.getenv("REPO_OWNER", "viku11")
@@ -92,6 +97,36 @@ def fetch_all_prs():
         raise RuntimeError("Cannot verify Git state. Check your GITHUB_TOKEN.")
 
 
+def fetch_original_file_count() -> int:
+    """Queries the GitHub Trees API against the frozen 'original' branch to count
+    all .js and .jsx files under frontend/src/. This is the true migration denominator."""
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/original?recursive=1"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        tree = response.json().get("tree", [])
+
+        count = 0
+        for item in tree:
+            path = item.get("path", "")
+            if item.get("type") == "blob" and path.startswith("frontend/src/"):
+                if path.endswith(".js") or path.endswith(".jsx"):
+                    count += 1
+
+        if count == 0:
+            logger.warning("⚠️ 'original' branch returned 0 JS/JSX files. Check branch name.")
+
+        return count
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch 'original' branch tree: {e}")
+        raise RuntimeError("Cannot determine migration baseline. Check 'original' branch exists.")
+
+
 def get_file_state(file_path: str, prs: list) -> str:
     """Checks GitOps state by matching the file path inside the PR Title."""
     for pr in prs:
@@ -109,21 +144,27 @@ def get_file_state(file_path: str, prs: list) -> str:
 
 def count_historical_merged_prs(prs: list) -> int:
     """Counts ALL merged migration PRs from GitHub — the single source of truth.
-    This captures the full 120+ files already merged, regardless of local disk state."""
+    This captures the full history of merged work, regardless of local disk state.
+    Handles both PR title conventions:
+      - 'Migrate src/utils/helpers.js to TS'
+      - 'migrate: AuthRouter.jsx -> AuthRouter.tsx'
+    Only counts PRs that have merged_at set (excludes closed-without-merge)."""
     count = 0
     for pr in prs:
-        title = pr.get("title", "")
-        if title.startswith("Migrate ") and pr.get("merged_at"):
-            count += 1
+        title = pr.get("title", "").strip().lower()
+        # MUST have merged_at — closed without merge is excluded
+        if pr.get("merged_at"):
+            if title.startswith("migrate ") or title.startswith("migrate:"):
+                count += 1
     return count
 
 
 def print_live_telemetry(in_progress_count: int, completed_count: int, pending_count: int, current_batch: int, total_batches: int):
     """Calculates and prints real-time metrics, and exports JSON to the React Command Center."""
     human_hours_saved = completed_count * 2
-    total_files = completed_count + in_progress_count + pending_count
-    progress_pct = (completed_count / total_files *
-                    100) if total_files > 0 else 0
+    # Progress is measured against the ORIGINAL 229-file baseline, not the shrinking DAG
+    total_files = ORIGINAL_FILE_COUNT
+    progress_pct = (completed_count / total_files * 100) if total_files > 0 else 0
 
     # 1. Print to Terminal (For the hacker aesthetic)
     print("\n" + "━"*60)
@@ -142,7 +183,7 @@ def print_live_telemetry(in_progress_count: int, completed_count: int, pending_c
 
     # 2. Export to React Dashboard (For the C-Suite UI)
     telemetry_data = {
-        "progress": {"completed": completed_count, "pending": pending_count, "in_progress": in_progress_count},
+        "progress": {"completed": completed_count, "pending": total_files - completed_count - in_progress_count, "in_progress": in_progress_count},
         "roi": {"hours_saved": human_hours_saved, "active_agents": in_progress_count},
         "batch": {"current": current_batch, "total": total_batches},
         "posture": {"security": "Zero-Trust (PR-Gated)", "resilience": "Stateless Auto-Resume Active"}
@@ -174,20 +215,23 @@ async def run_pipeline(src_dir: str):
             frontend_path).as_posix() for f in b] for b in batches]
         orchestrator = MigrationOrchestrator(client)
 
-        total_batch_files = sum(len(b) for b in formatted_batches)
-
         # ── HISTORICAL BASELINE (Cold Start Recovery) ──────────────────
-        # Query GitHub ONCE at boot to discover ALL previously merged work.
-        # This is the 120-file recovery that makes the dashboard jump instantly.
+        # Dynamically fetch the original file count from the frozen 'original' branch.
+        global ORIGINAL_FILE_COUNT
+        logger.info("🔍 Fetching migration baseline from 'original' branch...")
+        ORIGINAL_FILE_COUNT = fetch_original_file_count()
+        logger.info(f"📎 Baseline: {ORIGINAL_FILE_COUNT} JS/JSX files in 'original' branch.")
+
+        # Query GitHub to discover ALL previously merged work.
         logger.info("🔍 Querying GitHub for historical migration state...")
         boot_prs = fetch_all_prs()
         historical_completed = count_historical_merged_prs(boot_prs)
-        remaining_files = total_batch_files  # files the DAG still targets
+        remaining_files = ORIGINAL_FILE_COUNT - historical_completed
 
         logger.info(
             f"📊 COLD START: {historical_completed} files already merged on GitHub "
             f"({historical_completed * 2} hours saved). "
-            f"{remaining_files} files remaining in active DAG."
+            f"{remaining_files} files remaining out of {ORIGINAL_FILE_COUNT} original."
         )
 
         # Immediately write baseline telemetry so the React dashboard wakes up
@@ -225,11 +269,10 @@ async def run_pipeline(src_dir: str):
 
                 if not pending_files and not in_progress_files:
                     # Write telemetry BEFORE breaking so the dashboard reflects the completed batch
-                    remaining = sum(len(b) for b in formatted_batches[i+1:])
                     print_live_telemetry(
                         0,
                         global_completed,
-                        remaining,
+                        ORIGINAL_FILE_COUNT - global_completed,
                         i + 1,
                         len(formatted_batches)
                     )
@@ -262,13 +305,11 @@ async def run_pipeline(src_dir: str):
                         print("✅ [DRY RUN] Simulated dispatch complete. Zero credits spent.")
 
                 if in_progress_files or pending_files:
-                    remaining_pending = len(pending_files) + sum(len(b) for b in formatted_batches[i+1:])
-
                     # Triggers the executive telemetry for the presentation & dashboard
                     print_live_telemetry(
                         len(in_progress_files),
                         global_completed,
-                        remaining_pending,
+                        ORIGINAL_FILE_COUNT - global_completed - len(in_progress_files),
                         i + 1,
                         len(formatted_batches)
                     )
