@@ -21,6 +21,11 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# --- DRY RUN SAFETY TOGGLE ---
+# Set to True for pre-flight testing (no Devin credits spent, no PRs opened).
+# Set to False before the real recording.
+DRY_RUN = True
+
 # --- GITHUB GITOPS CONFIGURATION ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_OWNER = os.getenv("REPO_OWNER", "viku11")
@@ -102,6 +107,17 @@ def get_file_state(file_path: str, prs: list) -> str:
     return "PENDING"
 
 
+def count_historical_merged_prs(prs: list) -> int:
+    """Counts ALL merged migration PRs from GitHub — the single source of truth.
+    This captures the full 120+ files already merged, regardless of local disk state."""
+    count = 0
+    for pr in prs:
+        title = pr.get("title", "")
+        if title.startswith("Migrate ") and pr.get("merged_at"):
+            count += 1
+    return count
+
+
 def print_live_telemetry(in_progress_count: int, completed_count: int, pending_count: int, current_batch: int, total_batches: int):
     """Calculates and prints real-time metrics, and exports JSON to the React Command Center."""
     human_hours_saved = completed_count * 2
@@ -158,6 +174,31 @@ async def run_pipeline(src_dir: str):
             frontend_path).as_posix() for f in b] for b in batches]
         orchestrator = MigrationOrchestrator(client)
 
+        total_batch_files = sum(len(b) for b in formatted_batches)
+
+        # ── HISTORICAL BASELINE (Cold Start Recovery) ──────────────────
+        # Query GitHub ONCE at boot to discover ALL previously merged work.
+        # This is the 120-file recovery that makes the dashboard jump instantly.
+        logger.info("🔍 Querying GitHub for historical migration state...")
+        boot_prs = fetch_all_prs()
+        historical_completed = count_historical_merged_prs(boot_prs)
+        remaining_files = total_batch_files  # files the DAG still targets
+
+        logger.info(
+            f"📊 COLD START: {historical_completed} files already merged on GitHub "
+            f"({historical_completed * 2} hours saved). "
+            f"{remaining_files} files remaining in active DAG."
+        )
+
+        # Immediately write baseline telemetry so the React dashboard wakes up
+        print_live_telemetry(
+            in_progress_count=0,
+            completed_count=historical_completed,
+            pending_count=remaining_files,
+            current_batch=1,
+            total_batches=len(formatted_batches)
+        )
+
         for i, batch in enumerate(formatted_batches):
             print(f"\n{'='*50}")
             print(f" 📦 EVALUATING BATCH {i+1} OF {len(formatted_batches)}")
@@ -179,14 +220,16 @@ async def run_pipeline(src_dir: str):
                     elif state == "IN_PROGRESS":
                         in_progress_files.append(f)
 
+                # Recount global completed (historical + current batches)
+                global_completed = count_historical_merged_prs(current_prs)
+
                 if not pending_files and not in_progress_files:
-                    # Write telemetry BEFORE breaking so the dashboard reflects the completed batch (cold start fix)
-                    total_completed = sum(
-                        1 for b in formatted_batches for file in b if get_file_state(file, current_prs) == "COMPLETED")
+                    # Write telemetry BEFORE breaking so the dashboard reflects the completed batch
+                    remaining = sum(len(b) for b in formatted_batches[i+1:])
                     print_live_telemetry(
                         0,
-                        total_completed,
-                        sum(len(b) for b in formatted_batches[i+1:]),
+                        global_completed,
+                        remaining,
                         i + 1,
                         len(formatted_batches)
                     )
@@ -202,25 +245,30 @@ async def run_pipeline(src_dir: str):
                         branch = get_unique_branch_name(f)
                         prompt = build_migration_prompt(f, branch)
 
-                        task = asyncio.create_task(
-                            orchestrator.process_file(f, branch, prompt))
-                        tasks.append(task)
+                        if not DRY_RUN:
+                            task = asyncio.create_task(
+                                orchestrator.process_file(f, branch, prompt))
+                            tasks.append(task)
+                            # 10-second API rate limit safeguard
+                            await asyncio.sleep(10)
+                        else:
+                            print(f"  🛑 [DRY RUN] Would have dispatched agent for: {f}")
+                            await asyncio.sleep(1)
 
-                        # 10-second API rate limit safeguard
-                        await asyncio.sleep(10)
-
-                    await asyncio.gather(*tasks)
-                    print("✅ Dispatch complete. Agents are working.")
+                    if not DRY_RUN:
+                        await asyncio.gather(*tasks)
+                        print("✅ Dispatch complete. Agents are working.")
+                    else:
+                        print("✅ [DRY RUN] Simulated dispatch complete. Zero credits spent.")
 
                 if in_progress_files or pending_files:
-                    total_completed = sum(
-                        1 for b in formatted_batches for file in b if get_file_state(file, current_prs) == "COMPLETED")
+                    remaining_pending = len(pending_files) + sum(len(b) for b in formatted_batches[i+1:])
 
                     # Triggers the executive telemetry for the presentation & dashboard
                     print_live_telemetry(
                         len(in_progress_files),
-                        total_completed,
-                        len(pending_files),
+                        global_completed,
+                        remaining_pending,
                         i + 1,
                         len(formatted_batches)
                     )
