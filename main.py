@@ -36,6 +36,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_OWNER = os.getenv("REPO_OWNER")
 REPO_NAME = os.getenv("REPO_NAME")
 ORIGINAL_BRANCH = os.getenv("ORIGINAL_BRANCH", "original")
+TARGET_BRANCH = os.getenv("TARGET_BRANCH", "master")
 SOURCE_PREFIX = os.getenv("SOURCE_PREFIX", "frontend/src/")
 
 if not GITHUB_TOKEN or not REPO_OWNER or not REPO_NAME:
@@ -148,7 +149,7 @@ def fetch_master_file_list() -> set:
     """Fetches the full file tree from the master branch (1 API call).
     Returns a set of all file paths under SOURCE_PREFIX, with 'frontend/' stripped
     so paths match the manifest format (e.g., 'src/utils/helpers.js')."""
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/master?recursive=1"
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/{TARGET_BRANCH}?recursive=1"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
@@ -289,13 +290,15 @@ def load_or_build_batch_manifest(src_dir: str) -> list:
 def build_batch_details(formatted_batches: list, master_files: set) -> list:
     """Builds per-batch completion details for the dashboard topology chart.
     Uses the master branch file tree as the source of truth — not PR titles.
-    Each entry: { batch: 1, total: 26, completed: 24, in_progress: 0, pending: 2 }"""
+    Includes individual file paths and states for drill-down UI."""
     details = []
     for i, batch in enumerate(formatted_batches):
         completed = 0
         pending = 0
+        file_list = []
         for f in batch:
             state = get_file_state_from_tree(f, master_files)
+            file_list.append({"path": f, "state": state})
             if state == "COMPLETED":
                 completed += 1
             else:
@@ -305,7 +308,8 @@ def build_batch_details(formatted_batches: list, master_files: set) -> list:
             "total": len(batch),
             "completed": completed,
             "in_progress": 0,
-            "pending": pending
+            "pending": pending,
+            "files": file_list
         })
     return details
 
